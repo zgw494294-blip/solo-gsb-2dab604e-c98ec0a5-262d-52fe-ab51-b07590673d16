@@ -320,14 +320,23 @@ class HeatExposure:
 
 
 def _segment_above(
-    t0: datetime, v0: float, t1: datetime, v1: float, baseline: float
+    v0: float,
+    v1: float,
+    baseline: float,
+    off_start_us: int,
+    off_end_us: int,
+    span_us: int,
+    duration: float,
 ) -> tuple[float, float]:
-    """Above-baseline time and degree-seconds of one linear segment.
+    """Above-baseline time and degree-seconds of one clipped linear segment.
 
-    Temperature changes linearly from v0 at t0 to v1 at t1. When the
-    segment crosses ``baseline`` it is split at the crossing instant:
-    only the part strictly above T counts, and the excess integral of
-    that part is the trapezoidal area of (temperature - T).
+    Temperature changes linearly from v0 to v1 across the segment's
+    ``span_us`` microseconds; the clip window is the microsecond offset
+    range [off_start_us, off_end_us] within that span and lasts
+    ``duration`` seconds. When the temperature crosses ``baseline`` inside
+    the window it is split at the crossing instant: only the part strictly
+    above T counts, and the excess integral of that part is the
+    trapezoidal area of (temperature - T).
 
     All temperature arithmetic runs on one common power-of-two scale
     derived from the largest magnitude involved. The scale is the largest
@@ -347,6 +356,19 @@ def _segment_above(
         the smallest positive readings (e.g. 0 -> 5e-324, the minimum
         subnormal, at T = 0) interpolate instead of dividing by zero.
 
+    The clip-boundary heights are affine interpolations of the scaled
+    endpoint excess heights a0/a1, evaluated from the *nearer* endpoint:
+    a boundary one microsecond before t1 over a 1e11-second span sits at
+    fraction 1 - 1e-17 from t0, which rounds to exactly 1.0 in float64,
+    so a "from t0" evaluation (or any 1 - f form) loses the offset and
+    misreads the boundary temperature by a whole endpoint ulp. Taking the
+    fraction from the nearer endpoint keeps the microsecond offset as a
+    tiny but nonzero fraction of the span, so the boundary height keeps
+    its proper value between the baseline-adjacent floats (e.g. T one ulp
+    below sys.float_info.max) and the area of a microsecond-wide window
+    at the segment's end stays the true trapezoid instead of a
+    constant-endpoint rectangle.
+
     The scale is folded back in by multiplication *last*, after the tiny
     crossing ratio and the bounded scaled heights have already been
     multiplied together: multiplying it earlier (before the ~1e-16
@@ -356,44 +378,62 @@ def _segment_above(
     result can only become infinite when the true degree-second value
     itself exceeds the float range.
     """
-    total = (t1 - t0).total_seconds()
-    above0, above1 = v0 > baseline, v1 > baseline
+    # Largest of |v0|, |v1|, |T| may be zero (all three zero): then nothing
+    # is strictly above T. Otherwise frexp gives the binary exponent
+    # directly: the largest power of two not exceeding ``largest`` is
+    # 2**(exponent - 1). Unlike ldexp(1, floor(log2(largest))) this never
+    # asks for 2**1024, so it stays finite when largest is
+    # sys.float_info.max (log2 of which is exactly 1024.0).
+    largest = max(abs(v0), abs(v1), abs(baseline))
+    if largest == 0.0:
+        return 0.0, 0.0
+    scale = math.ldexp(1.0, math.frexp(largest)[1] - 1)
+    # Scaled excess heights (v - T) at the segment endpoints: the
+    # power-of-two divisions are exact and the subtractions of values in
+    # [-2, 2) can neither overflow nor underflow to a zero denominator.
+    a0 = v0 / scale - baseline / scale
+    a1 = v1 / scale - baseline / scale
+    slope = a1 - a0
+
+    def height_at(off_us: int) -> float:
+        # Affine interpolation of the scaled excess height at a clip
+        # boundary, evaluated from the nearer endpoint so the boundary's
+        # microsecond offset survives as a tiny fraction of the span
+        # (a "from the far endpoint" form rounds 1 - 1e-17 to 1.0 and
+        # loses it). Integer microsecond offsets keep the ratio exact
+        # relative to the whole span; an offset of 0 yields exactly a0
+        # and an offset of span_us exactly a1.
+        if off_us * 2 <= span_us:
+            return a0 + slope * (off_us / span_us)
+        return a1 - slope * ((span_us - off_us) / span_us)
+
+    h_start = height_at(off_start_us)
+    h_end = height_at(off_end_us)
+    above0, above1 = h_start > 0.0, h_end > 0.0
     if not above0 and not above1:
         return 0.0, 0.0
-
-    # Largest of |v0|, |v1|, |T| is strictly positive here: an endpoint
-    # strictly above a finite T guarantees a nonzero magnitude somewhere.
-    # frexp gives the binary exponent directly: the largest power of two
-    # not exceeding ``largest`` is 2**(exponent - 1). Unlike
-    # ldexp(1, floor(log2(largest))) this never asks for 2**1024, so it
-    # stays finite when largest is sys.float_info.max (log2 of which is
-    # exactly 1024.0).
-    largest = max(abs(v0), abs(v1), abs(baseline))
-    scale = math.ldexp(1.0, math.frexp(largest)[1] - 1)
-    w0, w1, wt = v0 / scale, v1 / scale, baseline / scale
     if above0 and above1:
-        # Trapezoid 0.5 * ((v0 - T) + (v1 - T)) * total; the differences
-        # are taken on the common scale, so they stay finite for any
-        # finite endpoints, and scale is multiplied back in last so a
-        # finite trapezoid cannot overflow on an intermediate product.
-        return total, 0.5 * total * ((w0 - wt) + (w1 - wt)) * scale
+        # Trapezoid 0.5 * (h_start + h_end) * duration on the common
+        # scale; the scaled heights stay finite for any finite endpoints,
+        # and scale is multiplied back in last so a finite trapezoid
+        # cannot overflow on an intermediate product.
+        return duration, 0.5 * duration * (h_start + h_end) * scale
 
-    # Exactly one endpoint above T: split at the (unique) crossing point.
-    # above_w is the scaled excess of the above endpoint, below_w the
-    # scaled depth of the other; the crossing fraction is excess over
-    # the whole span. The above part is a triangle in (temperature - T):
-    # area 0.5 * excess * above_time, all evaluated on the common scale
-    # with scale folded back in last.
-    if above0:
-        above_w = w0 - wt
-        below_w = wt - w1
+    # The temperature crosses T inside the clip window: split at the
+    # (unique) crossing point. above_w is the scaled excess of the
+    # above-side boundary, below_w the scaled depth of the other; the
+    # crossing fraction of the window is measured from the above side.
+    # The denominator is a sum of positive magnitudes, so it can neither
+    # cancel to zero nor overflow. The above part is a triangle in
+    # (temperature - T): area 0.5 * excess * above_time, all evaluated on
+    # the common scale with scale folded back in last.
+    if above1:
+        above_w, below_w = h_end, -h_start
     else:
-        above_w = w1 - wt
-        below_w = wt - w0
-    denom = above_w + below_w
-    above_ratio = above_w / denom
-    above_time = total * above_ratio
-    excess = 0.5 * total * above_w * above_ratio * scale
+        above_w, below_w = h_start, -h_end
+    above_ratio = above_w / (above_w + below_w)
+    above_time = duration * above_ratio
+    excess = 0.5 * above_time * above_w * scale
     return above_time, excess
 
 
@@ -422,12 +462,22 @@ def compute_heat_exposure(
     split at the crossing so above-time and the excess degree-second
     integral (trapezoid of temperature - T) count only the part above T.
 
-    Interpolated boundary temperatures are convex combinations of the two
-    endpoint readings (weights in [0, 1]) rather than the slope form
-    ``v0 + (v1 - v0) * fraction``: the slope overflows to +-inf whenever
-    the endpoint difference exceeds the float range (legitimate extremes
-    such as -1e308 -> 1e308), which used to turn the results into NaN.
-    The convex form stays finite for any finite endpoint temperatures.
+    Clip boundaries are passed to the segment math as exact integer
+    microsecond offsets within the segment's span (the resolution of the
+    stored timestamps), and the boundary temperatures are evaluated
+    inside the segment math as affine interpolations of the scaled
+    endpoint excess heights, taken from the *nearer* endpoint. A plain
+    fraction-of-span from t0 (or any ``1 - f`` form) rounds to exactly
+    1.0 in float64 for a boundary one microsecond before t1 of a
+    1e11-second span, silently snapping the boundary temperature to the
+    far endpoint; a slope form ``v0 + (v1 - v0) * fraction`` overflows to
+    +-inf whenever the endpoint difference exceeds the float range
+    (legitimate extremes such as -1e308 -> 1e308). The near-endpoint
+    affine form keeps the microsecond offset as a tiny nonzero fraction
+    of the span and stays finite for any finite endpoint temperatures,
+    so a microsecond-wide window at either end of a huge-span segment
+    keeps its true interpolated boundary temperature even when the
+    endpoints are the extreme finite floats and T sits one ulp away.
     The crossing ratio and the (temperature - T) area are likewise taken
     on one common power-of-two scale — the largest power of two not
     exceeding the largest magnitude of the two endpoints and T, taken
@@ -457,6 +507,7 @@ def compute_heat_exposure(
 
     covered = above = excess = 0.0
     m = timedelta(seconds=max_interval)
+    microsecond = timedelta(microseconds=1)
     for (t0, v0), (t1, v1) in zip(points, points[1:]):
         if t1 - t0 > m:
             continue  # long missing-sample stretch: no interpolation
@@ -466,19 +517,18 @@ def compute_heat_exposure(
 
         duration = (c_end - c_start).total_seconds()
         covered += duration
-        if v0 == v1:
-            cv0 = cv1 = v0  # constant segment: the exact endpoint value
-        else:
-            # Convex combination with weights in [0, 1]: finite for any
-            # finite endpoint temperatures, however extreme (the slope
-            # form v0 + (v1 - v0) * f overflows to inf/NaN when the
-            # endpoint difference exceeds the float range).
-            span = (t1 - t0).total_seconds()
-            f_start = (c_start - t0).total_seconds() / span
-            f_end = (c_end - t0).total_seconds() / span
-            cv0 = v0 * (1.0 - f_start) + v1 * f_start
-            cv1 = v0 * (1.0 - f_end) + v1 * f_end
-        seg_above, seg_excess = _segment_above(c_start, cv0, c_end, cv1, baseline)
+        # Exact integer microsecond offsets of the clip window within the
+        # segment's span (timedelta arithmetic is exact at microsecond
+        # resolution): the boundary temperatures are interpolated from
+        # these inside _segment_above, where the fraction is taken from
+        # the nearer endpoint so a microsecond offset from a segment end
+        # survives instead of rounding to exactly 0 or 1.
+        span_us = (t1 - t0) // microsecond
+        off_start_us = (c_start - t0) // microsecond
+        off_end_us = (c_end - t0) // microsecond
+        seg_above, seg_excess = _segment_above(
+            v0, v1, baseline, off_start_us, off_end_us, span_us, duration
+        )
         above += seg_above
         excess += seg_excess
 

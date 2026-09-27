@@ -880,6 +880,59 @@ def test_heat_exposure_smallest_subnormal_ramp_at_zero_baseline(client):
     assert body["excess_degree_seconds"] == 0.0
 
 
+def test_heat_exposure_last_microsecond_of_huge_span_keeps_boundary_offset(client):
+    # M = 1e11 s with the two readings exactly that far apart
+    # (2026-01-01T00:00:00Z -> 5194-11-16T09:46:40Z): the negative/positive
+    # maximum finite floats, T one representable step below the max. The
+    # query window is the LAST MICROSECOND of the segment: its start sits
+    # at fraction 1 - 1e-17 of the span, which rounds to exactly 1.0 in
+    # float64, so a boundary temperature interpolated from t0 (or any
+    # "1 - f" form) snaps to the +max endpoint and the sliver is misread
+    # as a constant-max segment (area = one full endpoint ulp above T,
+    # ~1.9958403095e286). Interpolating from the nearer endpoint keeps
+    # the microsecond offset: the true boundary temperature is
+    # -max + 2*max*(1 - 1e-17), and the trapezoid over the microsecond is
+    # ~1.8160709960e286.
+    max_float = sys.float_info.max
+    baseline = math.nextafter(max_float, 0.0)
+    set_thresholds(client)
+    set_sampling(client, max_interval=100000000000, grace=0)
+    post_readings(
+        client,
+        [
+            ("2026-01-01T00:00:00+00:00", -max_float),
+            ("5194-11-16T09:46:40+00:00", max_float),
+        ],
+    )
+    resp = get_heat(
+        client,
+        "5194-11-16T09:46:39.999999+00:00",
+        "5194-11-16T09:46:40+00:00",
+        baseline,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["covered_seconds"] == 0.000001
+    assert body["above_seconds"] == 0.000001
+    assert math.isfinite(body["excess_degree_seconds"])
+    assert body["excess_degree_seconds"] == pytest.approx(1.8160709960e286, rel=1e-9)
+
+    # The mirrored first-microsecond window with T one step above the
+    # negative extreme: the crossing sits ~5.5 us after the first reading,
+    # so the first microsecond is entirely below the baseline.
+    resp = get_heat(
+        client,
+        "2026-01-01T00:00:00+00:00",
+        "2026-01-01T00:00:00.000001+00:00",
+        math.nextafter(-max_float, 0.0),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["covered_seconds"] == 0.000001
+    assert body["above_seconds"] == 0.0
+    assert body["excess_degree_seconds"] == 0.0
+
+
 # ------------------------------------------------------------ freshness & UTC
 
 def test_heat_exposure_late_arrival_fills_gap(client):
