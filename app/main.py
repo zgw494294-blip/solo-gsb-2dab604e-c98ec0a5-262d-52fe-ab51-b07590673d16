@@ -1379,21 +1379,25 @@ def heat_exposure(
     longer gaps and the time outside the first/last reading are not
     extrapolated. Segments are clipped to [start, end] (a window boundary
     may be interpolated from the readings on either side of it) and split
-    wherever the temperature crosses T. The crossing fraction and the
-    (temperature - T) area are evaluated on one common power-of-two
-    scale derived from the largest magnitude involved (the scale comes
-    from frexp's binary exponent, so choosing it never overflows even
-    for the largest finite float), and the scale is folded back into
-    the area last, so legitimate finite extremes never overflow and
-    the smallest positive readings never underflow the crossing
-    division: a sliver of above-T time keeps its finite degree-second
-    area over any window length even when the rounded above_seconds
-    display is 0, and 0 -> 5e-324 at T = 0 reports full coverage with
-    an area that rounds to 0. The area is infinite only when the true
-    integral itself exceeds the float range. All time math is done in
-    UTC, and the result is always recomputed from the current readings
-    and M, so late arrivals, corrections and M changes take effect
-    immediately. A device without a sampling config returns 409.
+    wherever the temperature crosses T. Clip positions are held as exact
+    integer microseconds relative to the segment origin rather than as a
+    float fraction of the span, so a one-microsecond window at the very
+    end (or middle) of a span of any length keeps its microsecond
+    resolution instead of collapsing onto the endpoint reading. The
+    crossing position and the (temperature - T) area are evaluated on
+    one common power-of-two scale derived from the largest magnitude
+    involved (the scale comes from frexp's binary exponent, so choosing
+    it never overflows even for the largest finite float), and the scale
+    is folded back into the area last, so legitimate finite extremes
+    never overflow and the smallest positive readings never underflow
+    the crossing division: a sliver of above-T time keeps its finite
+    degree-second area over any window length even when the rounded
+    above_seconds display is 0, and 0 -> 5e-324 at T = 0 reports full
+    coverage with an area that rounds to 0. The area is infinite only
+    when the true integral itself exceeds the float range. All time math
+    is done in UTC, and the result is always recomputed from the current
+    readings and M, so late arrivals, corrections and M changes take
+    effect immediately. A device without a sampling config returns 409.
     """
     get_device_or_404(conn, device_id)
     if start.tzinfo is None:

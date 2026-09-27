@@ -880,6 +880,76 @@ def test_heat_exposure_smallest_subnormal_ramp_at_zero_baseline(client):
     assert body["excess_degree_seconds"] == 0.0
 
 
+def test_heat_exposure_endpoint_microsecond_keeps_resolution_on_long_ramp(client):
+    # M = 1e11 seconds; readings at 2026-01-01T00:00:00Z (negative max
+    # finite float) and exactly M seconds later, 5194-11-16T09:46:40Z
+    # (positive max finite float). T is the float immediately below the
+    # top reading. Querying the final microsecond of the span used to
+    # collapse the fraction (L-1)/L (1 - 1e-17) onto 1.0 in float64, so
+    # both clipped temperatures were pinned at the top reading and the
+    # trapezoid gained a full ULP-at-T of height it never had
+    # (1.9958403095e286 instead of the linear 1.8160709960e286). The
+    # clip position is now an exact integer microsecond, so the window
+    # keeps microsecond resolution relative to the whole span.
+    max_float = sys.float_info.max
+    near_max = math.nextafter(max_float, -math.inf)
+    span_seconds = 100_000_000_000
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = start + timedelta(seconds=span_seconds)
+    assert end == datetime(5194, 11, 16, 9, 46, 40, tzinfo=timezone.utc)
+    set_thresholds(client)
+    set_sampling(client, max_interval=span_seconds, grace=0)
+    post_readings(
+        client,
+        [
+            ("2026-01-01T00:00:00Z", -max_float),
+            ("5194-11-16T09:46:40Z", max_float),
+        ],
+    )
+    resp = get_heat(
+        client,
+        (end - timedelta(microseconds=1)).isoformat().replace("+00:00", "Z"),
+        end.isoformat().replace("+00:00", "Z"),
+        near_max,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["covered_seconds"] == 1e-06
+    # The crossing lies ~5.55 microseconds before the window end, so the
+    # whole queried microsecond is strictly above T.
+    assert body["above_seconds"] == 1e-06
+    # Linear-interpolation area of the final microsecond (trapezoid);
+    # the exact value is 1.8160709960484882408...e286 degree-seconds.
+    assert body["excess_degree_seconds"] == pytest.approx(
+        1.8160709960484882e286, rel=1e-15
+    )
+    assert body["excess_degree_seconds"] < 1.9958403095e286
+
+
+def test_heat_exposure_midspan_microsecond_keeps_resolution(client):
+    # A microsecond sitting mid-span must keep the same microsecond
+    # resolution: the window starts at the exact crossing instant and
+    # runs one microsecond up the ramp. Float fractions of a 2e8 second
+    # span cannot resolve the microsecond slope (height 5e-15) either.
+    span_seconds = 200_000_000
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = start + timedelta(seconds=span_seconds)
+    crossing = start + timedelta(seconds=span_seconds // 2)
+    set_thresholds(client)
+    set_sampling(client, max_interval=span_seconds, grace=0)
+    post_readings(client, [(start.isoformat(), 0.0), (end.isoformat(), 1.0)])
+    body = get_heat(
+        client,
+        crossing.isoformat().replace("+00:00", "Z"),
+        (crossing + timedelta(microseconds=1)).isoformat().replace("+00:00", "Z"),
+        0.5,
+    ).json()
+    assert body["covered_seconds"] == 1e-06
+    assert body["above_seconds"] == 1e-06
+    # Triangle: 0.5 * (height gained in 1us = 5e-15) * 1e-6 = 2.5e-21.
+    assert body["excess_degree_seconds"] == pytest.approx(2.5e-21, rel=1e-12)
+
+
 # ------------------------------------------------------------ freshness & UTC
 
 def test_heat_exposure_late_arrival_fills_gap(client):
